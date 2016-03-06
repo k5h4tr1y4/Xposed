@@ -7,6 +7,12 @@
 
 #define LOG_TAG "appproc"
 
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/prctl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <binder/IPCThreadState.h>
 #include <binder/ProcessState.h>
 #include <utils/Log.h>
@@ -17,12 +23,8 @@
 #include <android_runtime/AndroidRuntime.h>
 #include <private/android_filesystem_config.h>  // for AID_SYSTEM
 
-#include <stdlib.h>
-#include <stdio.h>
-#include <unistd.h>
-#include <sys/prctl.h>
-
 #include "xposed.h"
+#include <dlfcn.h>
 
 static bool isXposedLoaded = false;
 
@@ -99,8 +101,10 @@ public:
 
     virtual void onZygoteInit()
     {
+#if PLATFORM_SDK_VERSION <= 22
         // Re-enable tracing now that we're no longer in Zygote.
         atrace_set_tracing_enabled(true);
+#endif
 
         sp<ProcessState> proc = ProcessState::self();
         ALOGV("App process: starting thread pool.\n");
@@ -156,8 +160,10 @@ static void maybeCreateDalvikCache() {
     static const char kInstructionSet[] = "arm";
 #elif defined(__i386__)
     static const char kInstructionSet[] = "x86";
-#elif defined (__mips__)
+#elif defined (__mips__) && !defined(__LP64__)
     static const char kInstructionSet[] = "mips";
+#elif defined (__mips__) && defined(__LP64__)
+    static const char kInstructionSet[] = "mips64";
 #else
 #error "Unknown instruction set"
 #endif
@@ -192,6 +198,34 @@ static const char ZYGOTE_NICE_NAME[] = "zygote64";
 static const char ABI_LIST_PROPERTY[] = "ro.product.cpu.abilist32";
 static const char ZYGOTE_NICE_NAME[] = "zygote";
 #endif
+
+static void runtimeStart(AppRuntime& runtime, const char *classname, const Vector<String8>& options, bool zygote)
+{
+#if PLATFORM_SDK_VERSION >= 23
+  runtime.start(classname, options, zygote);
+#else
+  // try newer variant (5.1.1_r19 and later) first
+  void (*ptr1)(AppRuntime&, const char*, const Vector<String8>&, bool);
+  *(void **) (&ptr1) = dlsym(RTLD_DEFAULT, "_ZN7android14AndroidRuntime5startEPKcRKNS_6VectorINS_7String8EEEb");
+
+  if (ptr1 != NULL) {
+    ptr1(runtime, classname, options, zygote);
+    return;
+  }
+
+  // fall back to older variant
+  void (*ptr2)(AppRuntime&, const char*, const Vector<String8>&);
+  *(void **) (&ptr2) = dlsym(RTLD_DEFAULT, "_ZN7android14AndroidRuntime5startEPKcRKNS_6VectorINS_7String8EEE");
+
+  if (ptr2 != NULL) {
+    ptr2(runtime, classname, options);
+    return;
+  }
+
+  // should not happen
+  LOG_ALWAYS_FATAL("app_process: could not locate AndroidRuntime::start() method.");
+#endif
+}
 
 int main(int argc, char* const argv[])
 {
@@ -318,9 +352,9 @@ int main(int argc, char* const argv[])
 
     isXposedLoaded = xposed::initialize(zygote, startSystemServer, className, argc, argv);
     if (zygote) {
-        runtime.start(isXposedLoaded ? XPOSED_CLASS_DOTS_ZYGOTE : "com.android.internal.os.ZygoteInit", args);
+        runtimeStart(runtime, isXposedLoaded ? XPOSED_CLASS_DOTS_ZYGOTE : "com.android.internal.os.ZygoteInit", args, zygote);
     } else if (className) {
-        runtime.start(isXposedLoaded ? XPOSED_CLASS_DOTS_TOOLS : "com.android.internal.os.RuntimeInit", args);
+        runtimeStart(runtime, isXposedLoaded ? XPOSED_CLASS_DOTS_TOOLS : "com.android.internal.os.RuntimeInit", args, zygote);
     } else {
         fprintf(stderr, "Error: no class name or --zygote supplied.\n");
         app_usage();
